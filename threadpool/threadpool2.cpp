@@ -1,6 +1,6 @@
-/**** Copyright ************************************************
+/**** Copyright @meituan************************************************
     > File Name: threadpool2.cpp
-    > Author: 
+    > Author: liwanchuan@meituan.com
     > Created Time: Mon 07 Aug 2017 08:01:45 PM CST
  ************************************************************************/
 
@@ -13,20 +13,6 @@
 #include <functional>
 #include <mutex>
 #include <condition_variable>
-
-class Task {
-  public:
-    Task(std::string v):v(v) {};
-
-    void operator()() {
-        static int index =0;
-        if (!(index++%100000))
-            std::cout << "task:" << v << std::endl;
-
-    };
-
-    std::string v;
-};
 
 
 class ThreadPool {
@@ -92,6 +78,21 @@ class ThreadPool {
 };
 
 
+class Task {
+  public:
+    Task(std::string v):v(v) {};
+
+    void operator()() {
+        static int index = 0;
+        if (!(index++%100000))
+            std::cout << "task:" << v << std::endl;
+
+    };
+
+    std::string v;
+};
+
+
 int main(int argc, char **argv) {
     if (argc < 2)
         exit(0);
@@ -108,6 +109,5 @@ int main(int argc, char **argv) {
     }
 
     tp.Stop();
-
     return 0;
 }

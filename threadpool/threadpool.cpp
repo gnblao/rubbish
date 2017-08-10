@@ -16,6 +16,7 @@
 #include <sys/epoll.h>
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
+//#define _GNU_SOURCE
 #include <utmpx.h>
 
 #include <iostream>
@@ -23,24 +24,13 @@
 #include <atomic>
 #include <string>
 #include <vector>
+#include <map>
 #include <thread>
 #include <functional>
 
 #define MAX_EVENTS 10
 
-class Task {
-  public:
-    Task(std::string v):v(v) {};
-
-    void operator()() {
-        static int index =0;
-        if (!(index++%100000))
-            std::cout << "task:" << v << std::endl;
-    };
-
-    std::string v;
-};
-
+namespace threadpool {
 
 class Worker {
   public:
@@ -55,6 +45,7 @@ class Worker {
     std::atomic_flag queues_notify;
     std::queue< std::function<void()> > queues[2];
 
+    int debug = 0;
     struct epoll_event events[MAX_EVENTS];
 
     Worker(int cpu) {
@@ -73,6 +64,8 @@ class Worker {
 
         if (ep_fd > 0)
             close(ep_fd);
+
+        //    std::cout << " run_cpu_no:" << run_cpu_no << " debug:" << debug <<" no_h:" << queues[0].size() + queues[1].size() << std::endl;
     }
 
     Worker(Worker &&w) noexcept :
@@ -89,8 +82,6 @@ class Worker {
         w.pipefd[0] = -1;
         w.pipefd[1] = -1;
         w.ep_fd = -1;
-        //queues_flag[0] = w.queues_flag[0];
-        //queues_flag[1] = w.queues_flag[1];
     }
 
     void init() {
@@ -124,34 +115,33 @@ class Worker {
     }
 
     void notify(int cmd) {
-        if (!queues_notify.test_and_set() || cmd == 0) {
-            //  std::cout <<"worker_"<< run_cpu_no << " notify pipefd[1]:" <<pipefd[1] << std::endl;
-            int ret = write(pipefd[1], &cmd, sizeof(cmd));
-            if (ret < 0) {
-                //    std::cout  << "notify error!" << std::endl;
-
-                perror("notify");
-            }
+        if (cmd == 1 && queues_notify.test_and_set() ) {
+            return;
         }
+
+        //  std::cout <<"worker_"<< run_cpu_no << " notify pipefd[1]:" <<pipefd[1] << std::endl;
+        int ret = write(pipefd[1], &cmd, sizeof(cmd));
+        if (ret < 0) {
+            std::cout  << "notify error! cmd:" << cmd << std::endl;
+            perror("notify");
+        }
+
     }
 
-    // add new work item to the pool
+    // add new task to the worker
     bool enqueue(std::function<void()>& task) {
-        // don't allow enqueueing after stopping the pool
         if(stop) {
             std::cout << "enqueue on stopped worker\n";
             return false;
         }
 
         for (int i = 0; i < queues_num; i++) {
-            //if (queues_flag[i].compare_exchange_weak(false, true)) {
             if (!queues_flag[i].test_and_set()) {
                 queues[i].emplace(task);
 
                 // TODO notify worker thread
                 notify(1);
 
-                //queues_flag[i].compare_exchange_weak(true, false);
                 queues_flag[i].clear();
                 return true;
             }
@@ -162,8 +152,8 @@ class Worker {
 
     void handler () {
         for (int i = 0; i < queues_num; i++) {
-            //if (queues_flag[i].compare_exchange_strong(false, true)) {
             if (!queues_flag[i].test_and_set()) {
+                debug += queues[i].size();
                 while (!queues[i].empty()) {
                     std::function<void()> task = std::move(queues[i].front());
                     queues[i].pop();
@@ -172,9 +162,9 @@ class Worker {
                     task();
                 }
 
-                //queues_flag[i].compare_exchange_strong(true, false);
                 queues_flag[i].clear();
-                return;
+                if (!stop)
+                    return;
             }
 
         }
@@ -188,12 +178,13 @@ class Worker {
         pid_t pid = syscall(SYS_gettid);
         if (sched_setaffinity(pid, sizeof(set), &set) == -1)
             std::cout << "gettid:" << pid <<" sched_setaffinity error!\n";
-
+        /*
+                int cpu = sched_getcpu();
+                int ret =0;//= syscall(SYS_get_cpu, &cpu, NULL, NULL);
+                std::cout << "*ret:"<< ret<< "*****cpu:"<< cpu<< "****pid:" << pid << std::endl;
+        */
         int nfds;
         for (;;) {
-            if (stop)
-                return;
-
             nfds = epoll_wait(ep_fd, events, MAX_EVENTS, -1);
             if (nfds == -1) {
                 perror("epoll_wait");
@@ -210,6 +201,9 @@ class Worker {
                         continue;
                     }
                     switch(cmd) {
+                    case 0:
+                        handler();
+                        return;
                     case 1:
                         // TODO handler queues
                         handler();
@@ -235,38 +229,65 @@ void handler(Worker *w) {
 class ThreadPool {
   public:
     std::vector<std::thread> threads;
-    std::vector<Worker*> workers;
-    uint64_t next;
+    //std::vector<Worker*> workers;
+    std::vector<std::vector<Worker*>> workers_vl;
+    std::vector<uint32_t> nexts;
     int cpus;
 
-    ThreadPool(int threads_num):next(0) {
+    ThreadPool(int threads_num = 0) {
         cpus = get_nprocs();
-        cpus = threads_num > cpus ? cpus : threads_num;
+        threads_num = threads_num < 1 ? cpus : threads_num;
+
+        int idx = 0;
+        int idx_old = 0;
+        std::vector<Worker*> workers;
+        for (int i=0; i<threads_num; i++) {
+            Worker *w = new Worker(i%cpus);
+            threads.emplace_back(std::thread(handler, w));
+
+            idx = i%cpus;
+            if (idx_old != 0 && idx < static_cast<int>(workers_vl.size()))
+                workers_vl[idx].emplace_back(w);
+            else {
+                workers.emplace_back(w);
+                //std::cout << "*****idx_old:"<< idx_old << "****idx:" << idx << std::endl;
+                if (idx_old != idx || i == threads_num -1) {
+                    workers_vl.emplace_back(workers);
+                    idx_old = idx;
+                    workers.clear();
+                }
+
+                if (idx_old == 0 && idx ==0) {
+                    workers_vl.emplace_back(workers);
+                    workers.clear();
+                }
+            }
+        }
 
         for (int i=0; i<cpus; i++) {
-            Worker *w = new Worker(i);
-            threads.emplace_back(std::thread(handler, w));
-            workers.emplace_back(w);
+            nexts.emplace_back(0);
         }
-    }
-    
-    ThreadPool() {
-        ThreadPool(1000000000);
-    }
 
+        /*
+        std::cout << "**cpu:"<< cpus <<"****workers_vl.size:" << workers_vl.size() << std::endl;
+        for (auto wl : workers_vl) {
+            std::cout << "********workers.size:" << wl.size() << std::endl;
+        }
+        */
+    }
 
     ~ThreadPool() {
         for (auto &th : threads) th.join();
-        for (auto w : workers) delete w;
+        //for (auto w : workers) delete w;
+
+        for (auto wl : workers_vl) {
+            for (auto w : wl) delete w;
+        }
     }
 
-    bool enqueue(std::function<void()> &task) {
-        int cpu = sched_getcpu();
-        //std::cout << "****cpu:"<< cpu<<"****" << std::endl;
-        if (cpu <= workers.size() && workers[cpu]->enqueue(task)) {
-            return true;
-        } else {
-            for (auto w : workers) {
+    inline  bool for_wl(std::function<void()> &task) {
+        for (auto wl : workers_vl) {
+            for (auto w : wl) {
                 if (w->enqueue(task))
                     return true;
             }
@@ -275,26 +296,65 @@ class ThreadPool {
         return false;
     }
 
+
+    bool enqueue(std::function<void()> &task) {
+        int cpu = sched_getcpu();
+        int idx = cpu;
+
+        if (static_cast<int>(workers_vl.size()) > cpu) {
+            int idx_size = workers_vl[idx].size();
+            while (workers_vl[idx][(nexts[idx]++)%idx_size]->enqueue(task))
+                return true;
+
+            if (for_wl(task))
+                return true;
+        } else {
+            if (for_wl(task))
+                return true;
+        }
+
+        return false;
+    }
+
     void stop() {
-        for (auto w : workers) {
-            w->stop = true;
-            w->notify(0);
+        for (auto workers : workers_vl) {
+            for (auto w : workers) {
+                w->stop = true;
+                w->notify(0);
+            }
         }
     }
 };
+
+} // namespace
+
+
+
+class Task {
+  public:
+    Task(std::string v):v(v) {};
+
+    void operator()() {
+        static int index = 0;
+        if (!(index++%100000))
+            std::cout << "task:" << v << std::endl;
+    };
+
+    std::string v;
+};
+
 
 
 int main(int argc, char **argv) {
     if (argc < 2)
         exit(0);
 
-    int t_n = std::stoi(argv[1]); 
+    int t_n = std::stoi(argv[1]);
 
-    ThreadPool tp(t_n);
+    threadpool::ThreadPool tp(t_n);
 
     std::string in;
     while (getline(std::cin, in)) {
-
         std::function<void()> tsk = Task(in);
         if(!tp.enqueue(tsk)) {
             std::cout << "ThreadPool::enqueue error !" << std::endl;
